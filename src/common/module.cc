@@ -32,6 +32,7 @@
 // module.cc: Implement google_breakpad::Module.  See module.h.
 
 #include "common/module.h"
+#include "common/string_view.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -48,6 +49,53 @@ namespace google_breakpad {
 using std::dec;
 using std::hex;
 using std::unique_ptr;
+
+Module::InlineOrigin* Module::InlineOriginMap::GetOrCreateInlineOrigin(
+    uint64_t offset,
+    StringView name) {
+  uint64_t specification_offset = references_[offset];
+  // Find the root offset.
+  auto iter = references_.find(specification_offset);
+  while (iter != references_.end() &&
+         specification_offset != references_[specification_offset]) {
+    specification_offset = references_[specification_offset];
+    iter = references_.find(specification_offset);
+  }
+  if (inline_origins_.find(specification_offset) != inline_origins_.end()) {
+    if (inline_origins_[specification_offset]->name == "<name omitted>") {
+      inline_origins_[specification_offset]->name = name;
+    }
+    return inline_origins_[specification_offset];
+  }
+  inline_origins_[specification_offset] = new Module::InlineOrigin(name);
+  return inline_origins_[specification_offset];
+}
+
+void Module::InlineOriginMap::SetReference(uint64_t offset,
+                                           uint64_t specification_offset) {
+  // If we haven't seen this doesn't exist in reference map, always add it.
+  if (references_.find(offset) == references_.end()) {
+    references_[offset] = specification_offset;
+    return;
+  }
+  // If offset equals specification_offset and offset exists in
+  // references_, there is no need to update the references_ map.
+  // This early return is necessary because the call to erase in following if
+  // will remove the entry of specification_offset in inline_origins_. If
+  // specification_offset equals to references_[offset], it might be
+  // duplicate debug info.
+  if (offset == specification_offset ||
+      specification_offset == references_[offset])
+    return;
+
+  // Fix up mapping in inline_origins_.
+  auto remove = inline_origins_.find(references_[offset]);
+  if (remove != inline_origins_.end()) {
+    inline_origins_[specification_offset] = std::move(remove->second);
+    inline_origins_.erase(remove);
+  }
+  references_[offset] = specification_offset;
+}
 
 Module::Module(const string& name, const string& os,
                const string& architecture, const string& id,
@@ -200,7 +248,8 @@ void Module::GetStackFrameEntries(vector<StackFrameEntry*>* vec) const {
   *vec = stack_frame_entries_;
 }
 
-void Module::AssignSourceIds() {
+void Module::AssignSourceIds(
+    set<InlineOrigin*, InlineOriginCompare>& inline_origins) {
   // First, give every source file an id of -1.
   for (FileByNameMap::iterator file_it = files_.begin();
        file_it != files_.end(); ++file_it) {
@@ -216,13 +265,19 @@ void Module::AssignSourceIds() {
          line_it != func->lines.end(); ++line_it)
       line_it->file->source_id = 0;
   }
-  // Also mark all files cited by inline functions by setting each one's source
+
+  // Also mark all files cited by inline callsite by setting each one's source
   // id to zero.
-  for (InlineOrigin* origin : inline_origins_)
+  auto markInlineFiles = [](unique_ptr<Inline>& in) {
     // There are some artificial inline functions which don't belong to
     // any file. Those will have file id -1.
-    if (origin->file)
-      origin->file->source_id = 0;
+    if (in->call_site_file) {
+      in->call_site_file->source_id = 0;
+    }
+  };
+  for (auto func : functions_) {
+    Inline::InlineDFS(func->inlines, markInlineFiles);
+  }
 
   // Finally, assign source ids to those files that have been marked.
   // We could have just assigned source id numbers while traversing
@@ -236,29 +291,21 @@ void Module::AssignSourceIds() {
   }
 }
 
-static void InlineDFS(
-    vector<unique_ptr<Module::Inline>>& inlines,
-    std::function<void(unique_ptr<Module::Inline>&)> const& forEach) {
-  for (unique_ptr<Module::Inline>& in : inlines) {
-    forEach(in);
-    InlineDFS(in->child_inlines, forEach);
-  }
-}
-
-void Module::CreateInlineOrigins() {
+void Module::CreateInlineOrigins(
+    set<InlineOrigin*, InlineOriginCompare>& inline_origins) {
   // Only add origins that have file and deduplicate origins with same name and
   // file id by doing a DFS.
-  auto addInlineOrigins = [&](unique_ptr<Inline> &in) {
-    auto it = inline_origins_.find(in->origin);
-    if (it == inline_origins_.end())
-      inline_origins_.insert(in->origin);
+  auto addInlineOrigins = [&](unique_ptr<Inline>& in) {
+    auto it = inline_origins.find(in->origin);
+    if (it == inline_origins.end())
+      inline_origins.insert(in->origin);
     else
       in->origin = *it;
   };
   for (Function* func : functions_)
-    InlineDFS(func->inlines, addInlineOrigins);
+    Module::Inline::InlineDFS(func->inlines, addInlineOrigins);
   int next_id = 0;
-  for (InlineOrigin* origin: inline_origins_) {
+  for (InlineOrigin* origin : inline_origins) {
     origin->id = next_id++;
   }
 }
@@ -303,9 +350,10 @@ bool Module::Write(std::ostream& stream, SymbolData symbol_data) {
   }
 
   if (symbol_data & SYMBOLS_AND_FILES) {
-    if (symbol_data & INLINES)
-      CreateInlineOrigins();
-    AssignSourceIds();
+    // Get all referenced inline origins.
+    set<InlineOrigin*, InlineOriginCompare> inline_origins;
+    CreateInlineOrigins(inline_origins);
+    AssignSourceIds(inline_origins);
 
     // Write out files.
     for (FileByNameMap::iterator file_it = files_.begin();
@@ -318,13 +366,10 @@ bool Module::Write(std::ostream& stream, SymbolData symbol_data) {
       }
     }
     // Write out inline origins.
-    if (symbol_data & INLINES) {
-      for (InlineOrigin* origin : inline_origins_) {
-        stream << "INLINE_ORIGIN " << origin->id << " " << origin->getFileID()
-               << " " << origin->name << "\n";
-        if (!stream.good())
-          return ReportError();
-      }
+    for (InlineOrigin* origin : inline_origins) {
+      stream << "INLINE_ORIGIN " << origin->id << " " << origin->name << "\n";
+      if (!stream.good())
+        return ReportError();
     }
 
     // Write out functions and their inlines and lines.
@@ -344,19 +389,17 @@ bool Module::Write(std::ostream& stream, SymbolData symbol_data) {
           return ReportError();
 
         // Write out inlines.
-        if (symbol_data & INLINES) {
-          auto write_inline = [&](unique_ptr<Inline>& in) {
-            stream << "INLINE ";
-            stream << in->inline_nest_level << " " << in->call_site_line << " "
-                   << in->origin->id << hex;
-            for (const Range& r : in->ranges)
-              stream << " " << (r.address - load_address_) << " " << r.size;
-            stream << dec << "\n";
-          };
-          InlineDFS(func->inlines, write_inline);
-          if (!stream.good())
-            return ReportError();
-        }
+        auto write_inline = [&](unique_ptr<Inline>& in) {
+          stream << "INLINE ";
+          stream << in->inline_nest_level << " " << in->call_site_line << " "
+                 << in->getCallSiteFileID() << " " << in->origin->id << hex;
+          for (const Range& r : in->ranges)
+            stream << " " << (r.address - load_address_) << " " << r.size;
+          stream << dec << "\n";
+        };
+        Module::Inline::InlineDFS(func->inlines, write_inline);
+        if (!stream.good())
+          return ReportError();
 
         while ((line_it != func->lines.end()) &&
                (line_it->address >= range_it->address) &&
